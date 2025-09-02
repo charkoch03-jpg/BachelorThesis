@@ -1,0 +1,117 @@
+"""
+Detect cross dwells in the Free Viewing task.
+
+Inputs:  epoched x-positions (dominant eye is already considered), time vectors, picture onsets, and picture fixation times.
+Outputs: dwell start/end times (ms), calibration center, and no-dwell flags.
+"""
+
+
+import numpy as np
+import scipy.io as sio
+import csv
+from dwell_detection.dwell_core import (
+    as_1d,
+    detect_cross_dwell_auto,
+    indices_to_times,
+)
+
+# ------------------
+# Paths 
+# ------------------
+PATH_EPOCH_X   = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2/Continuos/epochedXPosition.mat"
+PATH_EPOCH_T   = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2/Continuos/epochedTimeVector.mat"
+PATH_PIC_CSV   = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2/Continuos/pictureOnsetTimes.csv"
+
+OUT_START_MAT  = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2/Continuos/fixationCrossStartTimes.mat"
+OUT_END_MAT    = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2/Continuos/fixationCrossEndTimes.mat"
+OUT_CENTER_MAT = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2/Continuos/calibrationCenterUsed.mat"
+OUT_FLAG_MAT   = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2/Continuos/calibrationStrategyFlag.mat"
+OUT_NODWL_MAT  = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2/Continuos/noDwellFlag.mat"
+
+# ------------------
+# Parameters 
+# ------------------
+DEFAULT_CENTER = 960.0
+DEFAULT_BAND   = 100.0          
+WINDOW_SIZE    = 30              
+STAB_THRESH    = 50.0            
+OUT_TOL_SAMP   = 50              
+
+# ------------------
+# Load data
+# ------------------
+x_obj = sio.loadmat(PATH_EPOCH_X)["epochedXPosition"]   
+t_obj = sio.loadmat(PATH_EPOCH_T)["epochedTimeVector"]  
+P, T = x_obj.shape
+assert t_obj.shape == (P, T), "x/time shapes mismatch."
+
+# Picture onsets (CSV → np.array [P x T])
+pic_onsets = []
+with open(PATH_PIC_CSV, newline="") as f:
+    reader = csv.reader(f)
+    _ = next(reader, None)  # header
+    for row in reader:
+        pic_onsets.append([float(v) if v else np.nan for v in row])
+pic_onsets = np.array(pic_onsets, dtype=float)
+assert pic_onsets.shape[0] == P, "participant count mismatch vs CSV"
+
+P, T = x_obj.shape
+
+# ------------------
+# Run detection
+# ------------------
+fix_start_ms = np.full((P, T), np.nan)
+fix_end_ms   = np.full((P, T), np.nan)
+center_used  = np.full((P, T), np.nan)
+strategy     = np.full((P, T), -1, dtype=int)
+no_dwell     = np.zeros((P, T), dtype=int)
+
+for p in range(P):
+    for tr in range(T):
+        x = as_1d(x_obj[p, tr])
+        t = as_1d(t_obj[p, tr])
+        if x.size == 0 or t.size == 0:
+            no_dwell[p, tr] = 1
+            continue
+
+        pic_time = pic_onsets[p, tr]
+        if not np.isfinite(pic_time):
+            # if picture time missing, search across full trial
+            end_idx = None
+        else:
+            end_idx = int(np.searchsorted(t, pic_time, side="left"))
+
+        s_idx, e_idx, c_used, flag = detect_cross_dwell_auto(
+            x, t,
+            default_center=DEFAULT_CENTER,
+            default_band=DEFAULT_BAND,
+            window_size=WINDOW_SIZE,
+            start_end_stability_threshold=STAB_THRESH,
+            min_out_of_threshold_samples=OUT_TOL_SAMP,
+            end_idx_exclusive=end_idx,
+        )
+        center_used[p, tr] = c_used if np.isfinite(c_used) else np.nan
+        strategy[p, tr] = flag
+
+        if s_idx is None or e_idx is None:
+            no_dwell[p, tr] = 1
+            continue
+
+        s_ms, e_ms = indices_to_times(t, s_idx, e_idx, relative_to_zero=True)
+        fix_start_ms[p, tr] = s_ms
+        fix_end_ms[p, tr]   = e_ms
+
+# ------------------
+# Save outputs
+# ------------------
+sio.savemat(OUT_START_MAT,  {"fixationStartTimes": fix_start_ms})
+sio.savemat(OUT_END_MAT,    {"fixationEndTimes":   fix_end_ms})
+sio.savemat(OUT_CENTER_MAT, {"calibrationCenterUsed": center_used})
+sio.savemat(OUT_FLAG_MAT,   {"calibrationStrategyFlag": strategy})
+sio.savemat(OUT_NODWL_MAT,  {"noDwellFlag": no_dwell})
+
+print("✅ Free-Viewing cross-dwell detection complete.")
+print("Counts by strategy flag (0=default, 1=estimated-first-stable, -1=not found):")
+unique, counts = np.unique(strategy, return_counts=True)
+print(dict(zip(unique, counts)))
+print(f"No-dwell trials: {int(no_dwell.sum())}")
