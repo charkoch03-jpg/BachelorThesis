@@ -1,0 +1,120 @@
+"""
+Detect cross dwells in the Cue task.
+
+Inputs:  epoched x-positions (left/right), time vectors, dominant eye info,
+         picture and cross onset indices.
+Outputs: dwell start/end times (ms relative to cross onset), calibration
+         center, strategy flag (0=default, 1=estimated, -1=not found),
+         and a no-dwell flag.
+"""
+
+import numpy as np
+import scipy.io as sio
+from dwell_detection.dwell_core import (
+    as_1d,
+    detect_cross_dwell_auto,
+    indices_to_times,
+    local_picture_index_from_globals,
+)
+
+# ------------------
+# Paths (edit if needed)
+# ------------------
+PATH_DOM_EYE = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/dominantEye_clean.mat"
+PATH_X_R     = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/xPositionRightCrosstoCross_clean.mat"
+PATH_X_L     = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/xPositionLeftCrosstoCross_clean.mat"
+PATH_T       = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/timeVectorCrosstoCross_clean.mat"
+PATH_PIC_IDX = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/pictureOnsets_idx_CrosstoCross.mat"
+PATH_CRO_IDX = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/crossOnsets_idx_CrosstoCross.mat"
+
+OUT_START_MAT  = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/fixationCrossStartTimes_LOCAL.mat"
+OUT_END_MAT    = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/fixationCrossEndTimes_LOCAL.mat"
+OUT_CENTER_MAT = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/calibrationCenterUsed.mat"
+OUT_FLAG_MAT   = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/calibrationStrategyFlag.mat"
+OUT_NODWL_MAT  = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask/noDwellFlag.mat"
+
+# ------------------
+# Parameters
+# ------------------
+DEFAULT_CENTER = 960.0
+DEFAULT_BAND   = 100.0          
+WINDOW_SIZE    = 30
+STAB_THRESH    = 50.0
+OUT_TOL_SAMP   = 50
+
+# ------------------
+# Load data
+# ------------------
+dom = sio.loadmat(PATH_DOM_EYE)["dominantEye"].ravel()  
+xR_obj = sio.loadmat(PATH_X_R)["xPositionRight"]        
+xL_obj = sio.loadmat(PATH_X_L)["xPositionLeft"]         
+t_obj  = sio.loadmat(PATH_T)["timeVector"]              
+po_obj = sio.loadmat(PATH_PIC_IDX)["pictureOnsetsIdx"]  
+co_obj = sio.loadmat(PATH_CRO_IDX)["crossOnsetsIdx"]    
+
+P, T = t_obj.shape
+assert xR_obj.shape == (P, T) and xL_obj.shape == (P, T) and po_obj.shape == (P, T) and co_obj.shape == (P, T)
+
+# ------------------
+# Run detection
+# ------------------
+fix_start_ms = np.full((P, T), np.nan)
+fix_end_ms   = np.full((P, T), np.nan)
+center_used  = np.full((P, T), np.nan)
+strategy     = np.full((P, T), -1, dtype=int)
+no_dwell     = np.zeros((P, T), dtype=int)
+
+for p in range(P):
+    for tr in range(T):
+        # dominant eye per participant
+        use_right = bool(int(dom[p]) == 1)
+        x_obj = xR_obj if use_right else xL_obj
+
+        x = as_1d(x_obj[p, tr])
+        t = as_1d(t_obj[p, tr])
+        if x.size == 0 or t.size == 0:
+            no_dwell[p, tr] = 1
+            continue
+
+        # map global picture/cross to local picture index (end cap)
+        pic_global   = as_1d(po_obj[p, tr])[0] if as_1d(po_obj[p, tr]).size else np.nan
+        cross_global = as_1d(co_obj[p, tr])[0] if as_1d(co_obj[p, tr]).size else np.nan
+        if np.isfinite(pic_global) and np.isfinite(cross_global):
+            end_idx = local_picture_index_from_globals(t, pic_global, cross_global)
+        else:
+            end_idx = None  # fall back to full trial
+
+        s_idx, e_idx, c_used, flag = detect_cross_dwell_auto(
+            x, t,
+            default_center=DEFAULT_CENTER,
+            default_band=DEFAULT_BAND,
+            window_size=WINDOW_SIZE,
+            start_end_stability_threshold=STAB_THRESH,
+            min_out_of_threshold_samples=OUT_TOL_SAMP,
+            end_idx_exclusive=end_idx,
+        )
+        center_used[p, tr] = c_used if np.isfinite(c_used) else np.nan
+        strategy[p, tr] = flag
+
+        if s_idx is None or e_idx is None:
+            no_dwell[p, tr] = 1
+            continue
+
+        s_ms, e_ms = indices_to_times(t, s_idx, e_idx, relative_to_zero=True)
+        fix_start_ms[p, tr] = s_ms
+        fix_end_ms[p, tr]   = e_ms
+
+# ------------------
+# Save outputs
+# ------------------
+sio.savemat(OUT_START_MAT,  {"fixationStartTimes": fix_start_ms})
+sio.savemat(OUT_END_MAT,    {"fixationEndTimes":   fix_end_ms})
+sio.savemat(OUT_CENTER_MAT, {"calibrationCenterUsed": center_used})
+sio.savemat(OUT_FLAG_MAT,   {"calibrationStrategyFlag": strategy})
+sio.savemat(OUT_NODWL_MAT,  {"noDwellFlag": no_dwell})
+
+print("✅ Cue-task cross-dwell detection complete.")
+print("Counts by strategy flag (0=default, 1=estimated-first-stable, -1=not found):")
+unique, counts = np.unique(strategy, return_counts=True)
+print(dict(zip(unique, counts)))
+print(f"No-dwell trials: {int(no_dwell.sum())}")
