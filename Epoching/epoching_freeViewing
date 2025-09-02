@@ -1,0 +1,243 @@
+"""
+Epoching  —  Free viewing task
+Two epoching modes:
+  1) Cross→Cross (variable length)
+  2) Picture-locked (fixed pre/post samples)
+
+What this script does:
+  • Loads data and excludes specific participants
+  • Derives cross/picture onset TIMES on the continuous axis from trial-relative cutouts and saves onset times to CSV
+  • (1) Cross→Cross: epochs x-position + pupil (dominant eye) & time vector
+  • (2) Picture-locked: epochs pupil (both eyes) & time vector with pre=500, post=512 samples
+"""
+
+import numpy as np
+import pandas as pd
+import scipy.io as sio
+import csv
+import matplotlib.pyplot as plt
+
+# ==============================
+# Config / paths
+# ==============================
+FS_HZ = 500.0  # Hz
+CROSS_CENTER_IDX   = 300  # where cross onset sits in timeVectorCross
+PICTURE_CENTER_IDX = 500  # where picture onset sits in timeVectorPicture
+
+# Picture-locked window (your numbers)
+PRE_SAMPLES  = 500   # 1000 ms
+POST_SAMPLES = 512   # 1024 ms
+EPOCH_LEN    = PRE_SAMPLES + POST_SAMPLES
+
+# Participants to exclude
+EXCLUDE = [42, 43, 120, 121]
+
+# Root paths (unchanged)
+ROOT = r"C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2"
+PATH_CONT = f"{ROOT}/Continuos"
+PATH_TASK = f"{ROOT}/Experiment1_Task2"
+PATH_FIX  = f"{ROOT}/Experiment1_Task2_Fixations"
+
+# Inputs
+DOMINANT_EYE_CSV = f"{PATH_TASK}/dominantEye.csv"
+XL_MAT   = f"{PATH_CONT}/xPositionLeftContinuos.mat"
+XR_MAT   = f"{PATH_CONT}/xPositionRightContinuos.mat"
+PR_MAT   = f"{PATH_CONT}/pupilSizeRight_cleanedInterpolated.mat"
+PL_MAT   = f"{PATH_CONT}/pupilSizeLeft_cleanedInterpolated.mat"
+TV_MAT   = f"{PATH_CONT}/timeVectorContinuos.mat"
+
+# Trial-relative time vectors (to locate onsets)
+TVCROSS_MAT   = f"{PATH_FIX}/fixation_timeVector.mat"  # cross-centered cutouts
+TVPICTURE_MAT = f"{PATH_TASK}/timeVector.mat"          # picture-centered cutouts
+
+# Outputs (onset CSVs + epoched MATs)
+CROSS_ONSETS_CSV   = f"{PATH_CONT}/crossOnsetTimes.csv"
+PICTURE_ONSETS_CSV = f"{PATH_CONT}/pictureOnsetTimes.csv"
+
+# Picture-locked outputs
+OUT_PIC_PL = f"{PATH_TASK}/PicturePupilLeft_epoched.mat"
+OUT_PIC_PR = f"{PATH_TASK}/PicturePupilRight_epoched.mat"
+OUT_PIC_T  = f"{PATH_TASK}/PictureTimeVector_epoched.mat"
+
+# Cross→Cross outputs (variable-length; object arrays)
+OUT_C2C_X  = f"{PATH_CONT}/epochedXPosition.mat"
+OUT_C2C_P  = f"{PATH_CONT}/epochedPupilSize.mat"
+OUT_C2C_T  = f"{PATH_CONT}/epochedTimeVector.mat"
+
+# ==============================
+# Load data
+# ==============================
+dominantEye = pd.read_csv(DOMINANT_EYE_CSV, header=None).values.flatten()
+
+xL = sio.loadmat(XL_MAT)["xPositionLeft"]
+xR = sio.loadmat(XR_MAT)["xPositionRight"]
+pR = sio.loadmat(PR_MAT)["pupilSizeRight"]
+pL = sio.loadmat(PL_MAT)["pupilSizeLeft"]
+tV = sio.loadmat(TV_MAT)["timeVector"]
+
+tV_cross   = sio.loadmat(TVCROSS_MAT)["timeVector"]   # shape ~ (participants, trials), each entry is a vector
+tV_picture = sio.loadmat(TVPICTURE_MAT)["timeVector"] # shape ~ (participants, trials), each entry is a vector
+
+# ==============================
+# Exclude participants 
+# ==============================
+xL = np.delete(xL, EXCLUDE, axis=0)
+xR = np.delete(xR, EXCLUDE, axis=0)
+pL = np.delete(pL, EXCLUDE, axis=0)
+pR = np.delete(pR, EXCLUDE, axis=0)
+tV = np.delete(tV, EXCLUDE, axis=0)
+tV_cross = np.delete(tV_cross, EXCLUDE, axis=0)
+tV_picture = np.delete(tV_picture, EXCLUDE, axis=0)
+dominantEye = np.delete(dominantEye, EXCLUDE, axis=0)
+
+# Derive counts from data (safer than hard-coding)
+n_participants = dominantEye.size
+# For trial count, take #cols in trial-relative matrices
+n_trials = tV_picture.shape[1] if tV_picture.ndim == 2 else 92  # fallback
+
+print(f"Participants after exclusion: {n_participants}, Trials: {n_trials}")
+
+# ==============================
+# Derive onset TIMES on the continuous axis
+# ==============================
+cross_onset_times   = np.full((n_participants, n_trials), np.nan)
+picture_onset_times = np.full((n_participants, n_trials), np.nan)
+
+for i in range(n_participants):
+    continuous_time = tV[i, 0].flatten()
+    for t in range(n_trials):
+        try:
+            cross_time_snippet = tV_cross[i, t][CROSS_CENTER_IDX]
+            picture_time_snippet = tV_picture[i, t][PICTURE_CENTER_IDX]
+
+            # map snippet time to the *nearest* absolute time in the continuous vector
+            cross_time_cont = continuous_time[np.argmin(np.abs(continuous_time - cross_time_snippet))]
+            picture_time_cont = continuous_time[np.argmin(np.abs(continuous_time - picture_time_snippet))]
+
+            cross_onset_times[i, t]   = cross_time_cont
+            picture_onset_times[i, t] = picture_time_cont
+        except Exception as e:
+            # If any trial is missing/short, we just leave NaN and continue
+            print(f"⚠️ Onset mapping error P{i}, T{t}: {e}")
+
+# Save onsets to CSV (same as your original)
+with open(CROSS_ONSETS_CSV, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow([f"Trial_{k+1}" for k in range(n_trials)])
+    w.writerows(cross_onset_times)
+with open(PICTURE_ONSETS_CSV, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow([f"Trial_{k+1}" for k in range(n_trials)])
+    w.writerows(picture_onset_times)
+
+print("✅ Saved cross/picture onset times (CSV).")
+
+# ==============================
+# 2) Picture-locked (fixed pre/post)
+# ==============================
+ep_pic_right = np.full((n_participants, n_trials, EPOCH_LEN), np.nan)
+ep_pic_left  = np.full((n_participants, n_trials, EPOCH_LEN), np.nan)
+ep_pic_time  = np.full((n_participants, n_trials, EPOCH_LEN), np.nan)
+
+for i in range(n_participants):
+    pupilRight = pR[i, 0].flatten()
+    pupilLeft  = pL[i, 0].flatten()
+    timeVec    = tV[i, 0].flatten()
+
+    for t in range(n_trials):
+        onset_time = picture_onset_times[i, t]
+        if not np.isfinite(onset_time):
+            continue
+
+        # prefer exact equality if it exists; otherwise use nearest time
+        idx_matches = np.where(timeVec == onset_time)[0]
+        onset_idx = int(idx_matches[0]) if idx_matches.size else int(np.argmin(np.abs(timeVec - onset_time)))
+
+        start = onset_idx - PRE_SAMPLES
+        end   = onset_idx + POST_SAMPLES
+
+        if 0 <= start and end <= timeVec.size:
+            ep_pic_time[i, t, :]  = timeVec[start:end]
+            ep_pic_right[i, t, :] = pupilRight[start:end]
+            ep_pic_left[i, t, :]  = pupilLeft[start:end]
+        else:
+            print(f"⛔ Picture-locked OOB: P{i}, T{t} (start {start}, end {end})")
+
+print("Picture-locked arrays:", ep_pic_time.shape, ep_pic_left.shape, ep_pic_right.shape)
+
+sio.savemat(OUT_PIC_PL, {"PupilSizeLeft":  ep_pic_left})
+sio.savemat(OUT_PIC_PR, {"PupilSizeRight": ep_pic_right})
+sio.savemat(OUT_PIC_T,  {"timeVector":     ep_pic_time})
+print("✅ Saved picture-locked epochs (.mat).")
+
+# ==============================
+# 1) Cross→Cross (variable length)
+# ==============================
+epoched_x_position = []
+epoched_pupil_size = []
+epoched_time_vector = []
+relative_picture_onset_indices = np.full((n_participants, n_trials), np.nan)
+
+for i in range(n_participants):
+    # dominant eye selection
+    if dominantEye[i] == 0:
+        x_data = xL[i, 0].flatten()
+        pupil_data = pL[i, 0].flatten()
+    else:
+        x_data = xR[i, 0].flatten()
+        pupil_data = pR[i, 0].flatten()
+    time_data = tV[i, 0].flatten()
+
+    x_epochs, pupil_epochs, time_epochs = [], [], []
+
+    for t in range(n_trials):
+        start_time = cross_onset_times[i, t]
+        if not np.isfinite(start_time):
+            # no cross → skip this trial
+            x_epochs.append(np.array([]))
+            pupil_epochs.append(np.array([]))
+            time_epochs.append(np.array([]))
+            relative_picture_onset_indices[i, t] = np.nan
+            continue
+
+        # End at next cross; if last trial, end at last available sample
+        end_time = cross_onset_times[i, t + 1] if t < n_trials - 1 and np.isfinite(cross_onset_times[i, t + 1]) else time_data[-1]
+        pic_time = picture_onset_times[i, t]
+
+        # Convert times → indices via nearest match on continuous axis
+        start_idx = int(np.argmin(np.abs(time_data - start_time)))
+        end_idx   = int(np.argmin(np.abs(time_data - end_time)))
+        pic_idx   = int(np.argmin(np.abs(time_data - pic_time))) if np.isfinite(pic_time) else -1
+
+        if 0 <= start_idx < end_idx <= x_data.size:
+            x_epoch = x_data[start_idx:end_idx]
+            pupil_epoch = pupil_data[start_idx:end_idx]
+            time_epoch = time_data[start_idx:end_idx]
+
+            x_epochs.append(x_epoch)
+            pupil_epochs.append(pupil_epoch)
+            time_epochs.append(time_epoch)
+
+            # relative picture onset (index within this epoch), store only if inside
+            rel_idx = pic_idx - start_idx
+            relative_picture_onset_indices[i, t] = rel_idx if 0 <= rel_idx < x_epoch.size else np.nan
+        else:
+            # keep placeholders so shapes align when saved as object arrays
+            bad_len = max(0, end_idx - start_idx)
+            x_epochs.append(np.full(bad_len, np.nan))
+            pupil_epochs.append(np.full(bad_len, np.nan))
+            time_epochs.append(np.full(bad_len, np.nan))
+            relative_picture_onset_indices[i, t] = np.nan
+
+    epoched_x_position.append(x_epochs)
+    epoched_pupil_size.append(pupil_epochs)
+    epoched_time_vector.append(time_epochs)
+
+epoched_x_position = np.array(epoched_x_position, dtype=object)
+epoched_pupil_size = np.array(epoched_pupil_size, dtype=object)
+epoched_time_vector = np.array(epoched_time_vector, dtype=object)
+
+sio.savemat(OUT_C2C_X, {"epochedXPosition": epoched_x_position})
+sio.savemat(OUT_C2C_P, {"epochedPupilSize": epoched_pupil_size})
+sio.savemat(OUT_C2C_T, {"epochedTimeVector": epoched_time_vector})
+print("✅ Saved Cross→Cross epochs (.mat).")
