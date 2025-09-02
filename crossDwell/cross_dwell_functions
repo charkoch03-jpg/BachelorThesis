@@ -1,0 +1,247 @@
+"""
+Cross-dwell detection core functions.
+
+Includes:
+- Basic helpers (flatten arrays, stability check, index→time conversion)
+- Calibration utilities (set band around center, estimate center from early samples)
+- Core dwell detection:
+  • detect_longest_dwell_within_band → finds longest stable dwell in given bounds
+  • detect_cross_dwell_auto → auto strategy: try default center, else estimate from first stable window
+"""
+
+
+from __future__ import annotations
+from typing import Optional, Tuple, Sequence
+import numpy as np
+
+
+# =========================
+# Basic helpers
+# =========================
+def as_1d(a: np.ndarray) -> np.ndarray:
+    """Return a flattened 1D float."""
+    return np.asarray(a, dtype=float).ravel()
+
+
+def is_stable(window: np.ndarray, stability_threshold: float) -> bool:
+    """
+    A window is 'stable' if its (nanmax - nanmin) ≤ stability_threshold.
+
+    """
+    if window.size == 0:
+        return False
+    wmax = np.nanmax(window)
+    wmin = np.nanmin(window)
+    if np.isnan(wmax) or np.isnan(wmin):
+        return False
+    return (wmax - wmin) <= stability_threshold
+
+
+def indices_to_times(
+    t: np.ndarray,
+    start_idx: Optional[int],
+    end_idx_inclusive: Optional[int],
+    *,
+    relative_to_zero: bool = False,
+) -> Tuple[float, float]:
+    """
+    Convert start/end indices into times.
+    If relative_to_zero=True, subtract t[0] to get ms relative to cross onset.
+
+    """
+    t = as_1d(t)
+    n = t.size
+    if (
+        start_idx is None or end_idx_inclusive is None
+        or start_idx < 0 or end_idx_inclusive < 0
+        or start_idx >= n or end_idx_inclusive >= n
+        or end_idx_inclusive < start_idx
+    ):
+        return np.nan, np.nan
+
+    s = t[start_idx]
+    e = t[end_idx_inclusive]
+    if relative_to_zero:
+        z = t[0]
+        s = s - z
+        e = e - z
+    return float(s), float(e)
+
+
+# =========================
+# Calibration / thresholds
+# =========================
+def calibrate_bounds(center: float, band: float) -> Tuple[float, float]:
+    """Return (lower, upper) = (center - band, center + band)."""
+    c = float(center); b = float(band)
+    return c - b, c + b
+
+
+def estimate_center_from_early_segment(
+    x: np.ndarray,
+    max_samples: int = 300,
+) -> float:
+    """
+    center estimate: median of the earliest portion of stable x position
+
+    """
+    x = as_1d(x)
+    take = int(min(max_samples, x.size))
+    if take <= 5:
+        return np.nan
+    seg = x[:take]
+    seg = seg[~np.isnan(seg)]
+    return float(np.median(seg)) if seg.size >= 5 else np.nan
+
+
+# =========================
+# Core dwell detection
+# =========================
+def detect_longest_dwell_within_band(
+    x: np.ndarray,
+    t: np.ndarray,
+    *,
+    lower: float,
+    upper: float,
+    window_size: int,
+    start_end_stability_threshold: float,
+    min_out_of_threshold_samples: int,
+    end_idx_exclusive: Optional[int] = None,
+    start_offset_samples: int = 2,
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Find the longest stable dwell fully inside [lower, upper] between indices
+    [0, end_idx_exclusive).
+
+    A dwell starts at the first index where a stable window (size=window_size,
+    max-min ≤ start_end_stability_threshold) lies fully within [lower, upper].
+    Once in-dwell, it ends when the signal has been outside [lower,upper]
+    for > min_out_of_threshold_samples consecutive samples, or at end_idx_exclusive-1.
+
+    Returns (start_idx, end_idx_inclusive), or (None, None) if nothing detected.
+
+    """
+    x = as_1d(x); t = as_1d(t)
+    n = x.size
+    if n == 0 or t.size != n:
+        return None, None
+
+    stop = n if end_idx_exclusive is None else int(max(0, min(end_idx_exclusive, n)))
+    if stop <= 0 or window_size <= 0 or stop < window_size:
+        return None, None
+
+    dwells = []
+    i = 0
+    while i <= stop - window_size:
+        w = x[i : i + window_size]
+        # must be entirely within bounds and stable
+        if (np.nanmin(w) >= lower) and (np.nanmax(w) <= upper) and is_stable(w, start_end_stability_threshold):
+            # start index (apply tiny offset)
+            start_idx = i + int(max(0, start_offset_samples))
+            start_idx = min(start_idx, stop - 1)
+
+            # extend forward
+            consec_out = 0
+            j = start_idx
+            while j < stop:
+                xi = x[j]
+                in_band = (lower <= xi <= upper) if np.isfinite(xi) else False
+                if in_band:
+                    consec_out = 0
+                else:
+                    consec_out += 1
+                    if consec_out > min_out_of_threshold_samples:
+                        end_idx = max(j - min_out_of_threshold_samples, start_idx)
+                        break
+                j += 1
+            else:
+                end_idx = stop - 1
+
+            dwells.append((start_idx, end_idx))
+            # continue search after this dwell
+            i = max(end_idx + 1, i + 1)
+            continue
+
+        i += 1
+
+    if not dwells:
+        return None, None
+
+    # Choose the longest dwell
+    lengths = [(e - s + 1) for (s, e) in dwells]
+    k = int(np.argmax(lengths))
+    return dwells[k]
+
+
+def detect_cross_dwell_auto(
+    x: np.ndarray,
+    t: np.ndarray,
+    *,
+    default_center: float,
+    default_band: float,
+    window_size: int,
+    start_end_stability_threshold: float,
+    min_out_of_threshold_samples: int,
+    end_idx_exclusive: Optional[int] = None,
+) -> Tuple[Optional[int], Optional[int], float, int]:
+    """
+    Auto cross-dwell detection:
+
+      (0) Try default_center ± default_band.
+      (1) If not found, locate the FIRST stable segment (size=window_size,
+          max-min ≤ start_end_stability_threshold), set its median as a new center,
+          then retry with new_center ± default_band.
+
+    Returns
+    -------
+    (start_idx, end_idx_inclusive, center_used, strategy_flag)
+      strategy_flag: 0=default, 1=estimated-from-first-stable, -1=not found
+    """
+    x = as_1d(x); t = as_1d(t)
+    n = x.size
+    if n == 0 or t.size != n:
+        return None, None, np.nan, -1
+
+    # cut-off
+    stop = n if end_idx_exclusive is None else int(max(0, min(end_idx_exclusive, n)))
+    if stop <= 0 or window_size <= 0:
+        return None, None, np.nan, -1
+
+    # ---- (0) try default center ± default_band
+    low0, up0 = calibrate_bounds(default_center, default_band)
+    s, e = detect_longest_dwell_within_band(
+        x, t,
+        lower=low0, upper=up0,
+        window_size=window_size,
+        start_end_stability_threshold=start_end_stability_threshold,
+        min_out_of_threshold_samples=min_out_of_threshold_samples,
+        end_idx_exclusive=stop,
+    )
+    if s is not None:
+        return s, e, float(default_center), 0
+
+    # ---- (1) find FIRST stable window → median = new center
+    new_center = np.nan
+    if stop >= window_size:
+        for i in range(0, stop - window_size + 1):
+            w = x[i : i + window_size]
+            if is_stable(w, start_end_stability_threshold):
+                # median of this FIRST stable segment
+                new_center = float(np.nanmedian(w))
+                break
+
+    if np.isfinite(new_center):
+        low1, up1 = calibrate_bounds(new_center, default_band)
+        s, e = detect_longest_dwell_within_band(
+            x, t,
+            lower=low1, upper=up1,
+            window_size=window_size,
+            start_end_stability_threshold=start_end_stability_threshold,
+            min_out_of_threshold_samples=min_out_of_threshold_samples,
+            end_idx_exclusive=stop,
+        )
+        if s is not None:
+            return s, e, new_center, 1
+
+    # not found
+    return None, None, float(new_center) if np.isfinite(new_center) else np.nan, -1
