@@ -9,7 +9,7 @@ Outputs: dwell start/end times (ms), calibration center, and no-dwell flags.
 import numpy as np
 import scipy.io as sio
 import csv
-from dwell_detection.dwell_core import (
+from crossDwell.cross_dwell_functions import (
     as_1d,
     detect_cross_dwell_auto,
     indices_to_times,
