@@ -4,7 +4,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 # If pupil_preprocessing.py is in src/, make it importable:
 sys.path.append(str(ROOT / "src"))
 
-from pupil_preprocessing import (
+from pupil_preprocessing.pupil_preprocessing_pipeline import (
     preprocess_mat_files,
     PreprocessConfig,
     save_mat_list,
