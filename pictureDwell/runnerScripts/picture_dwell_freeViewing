@@ -1,0 +1,157 @@
+"""
+Detect first & last picture dwells in free viewing task (CROSS→CROSS epochs).
+Saves starts/ends (ms), side (0=left,1=right), and valence (0=negative, 1=positive).
+"""
+
+import numpy as np
+import scipy.io as sio
+import pandas as pd
+import csv
+
+from pictureDwell.picture_dwell_functions import (
+    as_1d, indices_to_times,
+    find_first_picture_dwell, find_last_picture_dwell_after,
+)
+
+# ---------- paths ----------
+BASE = "C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/Eye Data Experiment1Task2"
+
+# Cross→cross epoched (dominant-eye already applied)
+X_EPOCHED_PATH = f"{BASE}/Continuos/epochedXPosition.mat"     
+T_EPOCHED_PATH = f"{BASE}/Continuos/epochedTimeVector.mat"    
+# Picture onset times 
+PIC_ONSETS_CSV = f"{BASE}/Continuos/pictureOnsetTimes.csv"
+
+# Dominant eye 
+DOM_EYE_CSV = f"{BASE}/Experiment1_Task2/dominantEye.csv"
+
+# First-dwell valences for both eyes
+VAL_RIGHT_CSV = f"{BASE}/Experiment1_Task2/valenceRightEye.csv"
+VAL_LEFT_CSV  = f"{BASE}/Experiment1_Task2/valenceLeftEye.csv"
+
+# Participants and trials to drop 
+participants_to_remove = [42, 43, 120, 121]
+DROP_TEST_TRIALS = True
+N_TEST = 4  
+
+# ---------- load cross→cross epoched ----------
+x_obj = sio.loadmat(X_EPOCHED_PATH)["epochedXPosition"]  # (P, T) object
+t_obj = sio.loadmat(T_EPOCHED_PATH)["epochedTimeVector"] # (P, T) object
+P, T = x_obj.shape
+
+# dominant eye + valence tables
+dom = pd.read_csv(DOM_EYE_CSV, header=None).values.flatten()
+val_right_eye = pd.read_csv(VAL_RIGHT_CSV, header=None).values.astype(float)
+val_left_eye  = pd.read_csv(VAL_LEFT_CSV,  header=None).values.astype(float)
+
+# picture onset times
+with open(PIC_ONSETS_CSV, newline="") as f:
+    reader = csv.reader(f)
+    _ = next(reader)  # header
+    pic_onsets = [[float(v) if v else np.nan for v in row] for row in reader]
+pic_onsets = np.array(pic_onsets, dtype=float)
+
+# drop excluded participants
+def drop_participants(arr):
+    return np.delete(arr, participants_to_remove, axis=0)
+
+x_obj = drop_participants(x_obj)
+t_obj = drop_participants(t_obj)
+dom   = np.delete(dom, participants_to_remove, axis=0)
+val_right_eye = drop_participants(val_right_eye)
+val_left_eye  = drop_participants(val_left_eye)
+pic_onsets    = drop_participants(pic_onsets)
+
+# drop test trials
+if DROP_TEST_TRIALS:
+    x_obj = x_obj[:, N_TEST:]
+    t_obj = t_obj[:, N_TEST:]
+    val_right_eye = val_right_eye[:, N_TEST:]
+    val_left_eye  = val_left_eye[:, N_TEST:]
+    pic_onsets    = pic_onsets[:, N_TEST:]
+    P, T = x_obj.shape
+
+# ---------- parameters ----------
+CENTER   = 960.0
+BAND     = 100.0
+WIN      = 20
+STAB_PX  = 50.0
+
+# ---------- outputs ----------
+first_start = np.full((P, T), np.nan)
+first_end   = np.full((P, T), np.nan)
+first_side  = np.full((P, T), np.nan)  
+
+last_start  = np.full((P, T), np.nan)
+last_end    = np.full((P, T), np.nan)
+last_side   = np.full((P, T), np.nan)
+
+first_val   = np.full((P, T), np.nan)  
+last_val    = np.full((P, T), np.nan) 
+
+for p in range(P):
+    # row from the valence table given dominant eye
+    val_row = val_right_eye[p] if dom[p] == 1 else val_left_eye[p]
+
+    for t in range(T):
+        xi = as_1d(x_obj[p, t])
+        ti = as_1d(t_obj[p, t])
+        if xi.size == 0 or ti.size == 0 or not np.isfinite(pic_onsets[p, t]):
+            continue
+
+        # picture onset index = nearest time in this trial’s time vector
+        pic_time = pic_onsets[p, t]
+        pic_idx  = int(np.argmin(np.abs(ti - pic_time)))
+        if pic_idx >= xi.size - 1:
+            continue
+
+        stop = xi.size  # end of trial
+
+        # ---------- first dwell (search from picture onset) ----------
+        s0, e0, side0 = find_first_picture_dwell(
+            xi, ti,
+            picture_onset_idx=pic_idx,
+            center=CENTER, band=BAND,
+            window_size=WIN, stability_threshold=STAB_PX,
+            end_idx_exclusive=stop,
+        )
+        if s0 is None:
+            continue
+
+        # ---------- last dwell (after the first) ----------
+        ls_idx, le_idx, lside = find_last_picture_dwell_after(
+            xi, ti,
+            search_from_idx=int(e0 + 1),
+            center=CENTER, band=BAND,
+            window_size=WIN, stability_threshold=STAB_PX,
+            end_idx_exclusive=stop,
+        )
+        if ls_idx is None:
+            # no later dwell ⇒ last = first
+            ls_idx, le_idx, lside = s0, e0, side0
+
+        # store absolute times
+        s0_ms, e0_ms = indices_to_times(ti, s0, e0, relative_to_zero=False)
+        ls_ms, le_ms = indices_to_times(ti, ls_idx, le_idx, relative_to_zero=False)
+
+        first_start[p, t] = s0_ms; first_end[p, t] = e0_ms; first_side[p, t] = side0
+        last_start[p, t]  = ls_ms; last_end[p, t]  = le_ms; last_side[p, t]  = lside
+
+        # ---------- valence ----------
+        fv = val_row[t] 
+        first_val[p, t] = fv
+        if np.isfinite(fv):
+            last_val[p, t] = fv if (lside == side0) else (1.0 - fv)
+
+# ---------- save ----------
+OUT = f"{BASE}/Experiment1_Task2"
+sio.savemat(f"{OUT}/firstPictureStartTimes.mat", {"firstPictureStartTimes": first_start})
+sio.savemat(f"{OUT}/firstPictureEndTimes.mat",   {"firstPictureEndTimes":  first_end})
+sio.savemat(f"{OUT}/firstPictureSide.mat",       {"firstPictureSide":      first_side})
+sio.savemat(f"{OUT}/lastPictureStartTimes.mat",  {"lastPictureStartTimes": last_start})
+sio.savemat(f"{OUT}/lastPictureEndTimes.mat",    {"lastPictureEndTimes":   last_end})
+sio.savemat(f"{OUT}/lastPictureSide.mat",        {"lastPictureSide":       last_side})
+sio.savemat(f"{OUT}/firstPictureValence.mat",    {"firstPictureValence":   first_val})
+sio.savemat(f"{OUT}/lastPictureValence.mat",     {"lastPictureValence":    last_val})
+
+print("✅ Free viewing (cross→cross): saved first/last picture dwell times, sides, and valence.")
