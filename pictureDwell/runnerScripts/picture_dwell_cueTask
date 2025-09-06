@@ -1,0 +1,157 @@
+"""
+Detect first & last picture dwells in the cue task (cross→cross data).
+Saves starts/ends (ms), side (0=left, 1=right), and valence (0=neg, 1=pos).
+"""
+
+import numpy as np
+import scipy.io as sio
+from pictureDwell.picture_dwell_functions import (
+    as_1d, indices_to_times,
+    find_first_picture_dwell, find_last_picture_dwell_after,
+)
+
+# ---------- paths ----------
+BASE = "C:/Users/charl/OneDrive/Dokumente/Uni/7. Semester/Bachelor Thesis/ArrowTask"
+DOM_PATH   = f"{BASE}/dominantEye_clean.mat"                  
+XR_PATH    = f"{BASE}/xPositionRightCrosstoCross_clean.mat"   
+XL_PATH    = f"{BASE}/xPositionLeftCrosstoCross_clean.mat"    
+TV_PATH    = f"{BASE}/timeVectorCrosstoCross_clean.mat"       
+PIC_IDX_G  = f"{BASE}/pictureOnsets_idx_CrosstoCross.mat"     
+CROSS_IDX_G= f"{BASE}/crossOnsets_idx_CrosstoCross.mat"       
+RT_PATH    = f"{BASE}/reactionTimes_clean.mat"                
+SEQ_PATH   = f"{BASE}/pictureSequence_clean.mat"              
+
+# ---------- load ----------
+dom = sio.loadmat(DOM_PATH)["dominantEye"]      
+xR  = sio.loadmat(XR_PATH)["xPositionRight"]    
+xL  = sio.loadmat(XL_PATH)["xPositionLeft"]     
+tv  = sio.loadmat(TV_PATH)["timeVector"]        
+po_obj = sio.loadmat(PIC_IDX_G)["pictureOnsetsIdx"]
+co_obj = sio.loadmat(CROSS_IDX_G)["crossOnsetsIdx"]
+rt  = sio.loadmat(RT_PATH)["reactionTimes"]     
+
+# pictureSequence: (T,2,P) -> transpose to (P,T,2)
+seq_raw = sio.loadmat(SEQ_PATH)["pictureSequence"]
+if seq_raw.ndim != 3 or seq_raw.shape[1] != 2:
+    raise ValueError("pictureSequence_clean.mat must be (T,2,P).")
+seq = np.transpose(seq_raw, (2, 0, 1)).astype(float) 
+P, T = xR.shape
+assert seq.shape[:2] == (P, T)
+
+# Derive valence per side from picture IDs (1..44 => 1 (positive), else 0 (negative))
+pic_left_id  = seq[:, :, 0]  # (P,T)
+pic_right_id = seq[:, :, 1]  # (P,T)
+val_left  = np.where((pic_left_id >= 1) & (pic_left_id <= 44), 1.0, 0.0)   # (P,T)
+val_right = np.where((pic_right_id >= 1) & (pic_right_id <= 44), 1.0, 0.0) # (P,T)
+
+# ---------- helpers ----------
+def pick_eye_row(p: int):
+    """Return the (P,T) object array for the participant's dominant eye."""
+    return xR if int(dom[0, p]) == 1 else xL  # 1=right, 0=left
+
+def scalar_from_cell(cell):
+    a = as_1d(cell)
+    return float(a[0]) if a.size else np.nan
+
+def local_picture_index(p: int, t: int, t_vec: np.ndarray) -> int:
+    """Map global picture/cross indices to local picture-onset index (assumes 500 Hz = 2 ms/sample)."""
+    pic_g   = scalar_from_cell(po_obj[p, t])
+    cross_g = scalar_from_cell(co_obj[p, t])
+    if not (np.isfinite(pic_g) and np.isfinite(cross_g)) or t_vec.size == 0:
+        return t_vec.size
+    offset_samples = pic_g - cross_g
+    pic_time = t_vec[0] + offset_samples * 2.0  # ms
+    if t_vec[0] <= pic_time <= t_vec[-1]:
+        return int(np.searchsorted(t_vec, pic_time, side="left"))
+    return t_vec.size
+
+# ---------- parameters ----------
+CENTER  = 960.0
+BAND    = 100.0
+WIN     = 20
+STAB_PX = 50.0
+FS_HZ   = 500.0 
+
+# ---------- outputs ----------
+first_start = np.full((P, T), np.nan)
+first_end   = np.full((P, T), np.nan)
+first_side  = np.full((P, T), np.nan)  # 0=left, 1=right
+first_val   = np.full((P, T), np.nan)  # 0=neg, 1=pos
+
+last_start  = np.full((P, T), np.nan)
+last_end    = np.full((P, T), np.nan)
+last_side   = np.full((P, T), np.nan)
+last_val    = np.full((P, T), np.nan)
+
+# ---------- main loop ----------
+for p in range(P):
+    x_eye = pick_eye_row(p)
+    for t in range(T):
+        xi = as_1d(x_eye[p, t])
+        ti = as_1d(tv[p, t]).astype(float)
+        if xi.size == 0 or ti.size == 0:
+            continue
+
+        # local picture onset index (relative to cross onset)
+        pic_idx = local_picture_index(p, t, ti)
+        if pic_idx >= xi.size - 1:
+            continue
+
+        # cap by RT: search window = [pic_idx, pic_idx + RT]
+        rts = float(rt[t, p]) if np.isfinite(rt[t, p]) else np.nan
+        if np.isfinite(rts):
+            stop = min(int(pic_idx + round(rts * FS_HZ)), xi.size)
+            if stop <= pic_idx + 1:
+                continue
+        else:
+            stop = xi.size
+
+        # first dwell (from picture onset)
+        s0, e0, side0 = find_first_picture_dwell(
+            xi, ti,
+            picture_onset_idx=pic_idx,
+            center=CENTER, band=BAND,
+            window_size=WIN, stability_threshold=STAB_PX,
+            end_idx_exclusive=stop,
+        )
+        if s0 is None:
+            continue
+
+        # last dwell (after the first)
+        ls_idx, le_idx, lside = find_last_picture_dwell_after(
+            xi, ti,
+            search_from_idx=int(e0 + 1),
+            center=CENTER, band=BAND,
+            window_size=WIN, stability_threshold=STAB_PX,
+            end_idx_exclusive=stop,
+        )
+        if ls_idx is None:
+            ls_idx, le_idx, lside = s0, e0, side0
+
+        # times 
+        s0_ms, e0_ms = indices_to_times(ti, s0, e0, relative_to_zero=False)
+        ls_ms, le_ms = indices_to_times(ti, ls_idx, le_idx, relative_to_zero=False)
+
+        first_start[p, t] = s0_ms; first_end[p, t] = e0_ms; first_side[p, t] = side0
+        last_start[p, t]  = ls_ms; last_end[p, t]  = le_ms; last_side[p, t]  = lside
+
+        # -------- valence from picture IDs --------
+        # First dwell: valence
+        fv = val_left[p, t] if side0 == 0 else val_right[p, t]  
+        first_val[p, t] = fv
+
+        # Last dwell: if same side ⇒ same valence; else opposite valence
+        last_val[p, t] = fv if (lside == side0) else (1.0 - fv)
+
+# ---------- save ----------
+sio.savemat(f"{BASE}/firstPictureStartTimes.mat", {"firstPictureStartTimes": first_start})
+sio.savemat(f"{BASE}/firstPictureEndTimes.mat",   {"firstPictureEndTimes":  first_end})
+sio.savemat(f"{BASE}/firstPictureSide.mat",       {"firstPictureSide":      first_side})
+sio.savemat(f"{BASE}/firstPictureValence.mat",    {"firstPictureValence":   first_val})
+
+sio.savemat(f"{BASE}/lastPictureStartTimes.mat",  {"lastPictureStartTimes": last_start})
+sio.savemat(f"{BASE}/lastPictureEndTimes.mat",    {"lastPictureEndTimes":   last_end})
+sio.savemat(f"{BASE}/lastPictureSide.mat",        {"lastPictureSide":       last_side})
+sio.savemat(f"{BASE}/lastPictureValence.mat",     {"lastPictureValence":    last_val})
+
+print("✅ Cue task (cross→cross): saved first/last picture dwell times, sides, and valence.")
